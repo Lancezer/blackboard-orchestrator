@@ -1,0 +1,7 @@
+{
+  "codex": { "model": null, "reasoning_effort": null },
+  "dsh": { "provider": null, "model": null, "reasoning_effort": null },
+  "limits": { "codex_concurrency": 2, "dsh_concurrency": 2 },
+  "phase_timeout_minutes": 45,
+  "dsh_port": 0
+}

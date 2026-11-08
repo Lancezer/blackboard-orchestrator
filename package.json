@@ -1,0 +1,10 @@
+{
+  "name": "blackboard-orchestrator",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "description": "Personal Codex and DeepSeek Harness session relay",
+  "engines": { "node": ">=24.9" },
+  "scripts": { "start": "node src/cli.mjs", "test": "node --test tests/*.test.mjs" },
+  "bin": { "blackboard": "./src/cli.mjs" }
+}

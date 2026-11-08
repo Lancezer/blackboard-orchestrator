@@ -1,0 +1,5 @@
+- insert:
+    - id: blackboard-relay-bridge
+      name: 'blackboard-relay/bridge-loader'
+    - id: blackboard-relay-tools
+      name: 'blackboard-relay/tools-loader'

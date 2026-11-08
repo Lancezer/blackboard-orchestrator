@@ -1,0 +1,13 @@
+{
+  "name": "blackboard-relay",
+  "version": "0.3.0",
+  "description": "本地 Codex 与 DeepSeek Harness 会话交接",
+  "type": "module",
+  "exports": {
+    "./bridge-loader": "./bridge-loader.mjs",
+    "./tools-loader": "./tools-loader.mjs",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } }
+}
