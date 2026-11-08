@@ -93,3 +93,103 @@ test('只请求一次交接时不自动唤醒源会话', async t => {
   assert.equal(task.phase, 'DONE'); assert.deepEqual(f.starts, ['dsh:dsh-C']);
   assert.match(taskDir(root, id), /\.codex-dsh\/tasks\//);
 });
+
+test('代码交接要求批准和干净工作区，不替用户提交', async t => {
+  const { root, repo } = await fixture(t), f = clients(root, repo);
+  const controller = new RelayController(root, config, async () => f.codex, f.dsh);
+  const input = { sourceRole: 'codex', sourceId: 'codex-source', sourceCwd: repo, targetCwd: repo, changesCode: true };
+  await assert.rejects(request(root, controller, input), /批准/);
+  await writeFile(join(repo, 'personal.txt'), 'user\n');
+  await assert.rejects(request(root, controller, { ...input, planApproved: true }), /未提交或未跟踪/);
+  assert.equal(await readFile(join(repo, 'personal.txt'), 'utf8'), 'user\n');
+  assert.match(await git(repo, ['status', '--porcelain']), /personal\.txt/);
+});
+
+test('源会话停稳后再次检查工作区，不启动目标会话', async t => {
+  const { root, repo } = await fixture(t), f = clients(root, repo);
+  const controller = new RelayController(root, config, async () => f.codex, f.dsh);
+  const { id } = await request(root, controller, { sourceRole: 'codex', sourceId: 'codex-source', sourceCwd: repo, targetCwd: repo, changesCode: true, planApproved: true, deferStart: true });
+  await writeFile(join(repo, 'late.txt'), 'late change\n');
+  controller.run(id);
+  const task = await done(controller, root, id);
+  assert.equal(task.phase, 'BLOCKED');
+  assert.match(task.message, /未提交或未跟踪/);
+  assert.deepEqual(f.starts, []);
+  assert.equal(await readFile(join(repo, 'late.txt'), 'utf8'), 'late change\n');
+});
+
+test('重启只阻断未完成的交接，明确重试后才重新调度', async t => {
+  const { root } = await fixture(t);
+  const hop = { revision: 1, fromRole: 'codex', fromId: 'source' };
+  await writeTask(root, { id: 'interrupted', kind: 'relay', phase: 'RUNNING', owner: 'dsh', ownerId: 'target', revision: 1, participants: [], documents: {}, activeHop: hop });
+  const controller = new RelayController(root, config, async () => ({}), {}), started = [];
+  controller.run = id => started.push(id);
+  await controller.recoverOnStartup();
+  assert.equal((await readTask(root, 'interrupted')).phase, 'BLOCKED');
+  assert.deepEqual(started, []);
+  await assert.rejects(controller.resume('interrupted'), /--retry/);
+  await controller.resume('interrupted', true);
+  const task = await readTask(root, 'interrupted');
+  assert.equal(task.phase, 'WAITING');
+  assert.deepEqual(task.pending, hop);
+  assert.equal(task.activeHop, null);
+  assert.deepEqual(started, ['interrupted']);
+});
+
+test('获批扩展项目后迁移交接材料并保留旧路径', async t => {
+  const { base, root, repo, ignore } = await fixture(t), f = clients(root, repo), other = join(base, 'other');
+  await mkdir(other); await git(other, ['init', '-q']); await git(other, ['config', 'user.name', 'Test']); await git(other, ['config', 'user.email', 'test@example.invalid']);
+  await git(other, ['config', 'core.excludesfile', ignore]); await writeFile(join(other, 'base.txt'), 'other\n'); await git(other, ['add', 'base.txt']); await git(other, ['commit', '-qm', 'base']);
+  const controller = new RelayController(root, config, async () => f.codex, f.dsh); let taskId;
+  f.codexSteps.push(async () => request(root, controller, { taskId, sourceRole: 'codex', sourceId: 'codex-B', sourceCwd: repo, targetCwd: other, projects: [other], scopeApproved: true, newSession: true }));
+  taskId = (await request(root, controller, { sourceRole: 'dsh', sourceId: 'dsh-A', sourceCwd: repo, targetCwd: repo, newSession: true })).id;
+  const old = join(repo, '.codex-dsh', 'tasks', taskId), task = await done(controller, root, taskId);
+  assert.equal(task.phase, 'DONE'); assert.equal(taskDir(root, taskId), join(root, 'tasks', taskId));
+  assert.equal((await lstat(old)).isSymbolicLink(), true); assert.match(await readFile(join(old, 'HANDOFF.md'), 'utf8'), /参与会话/);
+});
+
+test('Codex 临时权限在同一线程下一回合生效，结束后恢复', async t => {
+  const { root, repo } = await fixture(t), f = clients(root, repo);
+  const controller = new RelayController(root, config, async () => f.codex, f.dsh); let taskId;
+  f.codexSteps.push(async () => {
+    const continuationId = randomUUID(); await atomicWrite(join(root, 'pending', `${continuationId}.md`), '继续完成已批准的工作。');
+    await controller.setPermission({ taskId, sourceRole: 'codex', sourceId: 'codex-B', sourceCwd: repo, role: 'codex', sessionId: 'codex-B', profile: ':full', persistent: false, continuationId });
+    assert.equal(f.getProfile(), ':full');
+  });
+  taskId = (await request(root, controller, { sourceRole: 'dsh', sourceId: 'dsh-A', sourceCwd: repo, targetCwd: repo, newSession: true })).id;
+  const task = await done(controller, root, taskId);
+  assert.equal(task.phase, 'DONE'); assert.deepEqual(f.starts, ['codex:codex-B', 'codex:codex-B']);
+  assert.deepEqual(f.updates.map(x => x.permissions), [':full', ':workspace']); assert.equal(f.getProfile(), ':workspace');
+});
+
+test('空闲会话调整临时权限后接续时，先保存原权限再启动回合', async t => {
+  const { root, repo } = await fixture(t), f = clients(root, repo);
+  const controller = new RelayController(root, config, async () => f.codex, f.dsh);
+  const continuationId = randomUUID();
+  await atomicWrite(join(root, 'pending', `${continuationId}.md`), '在当前会话继续工作。');
+  const result = await controller.setPermission({ sourceRole: 'codex', sourceId: 'codex-existing', sourceCwd: repo,
+    role: 'codex', sessionId: 'codex-existing', profile: ':full', persistent: false, continuationId });
+  const id = result.message.match(/任务 ID：(task-[a-z0-9-]+)/)?.[1];
+  assert.ok(id);
+  const task = await done(controller, root, id);
+  assert.equal(task.phase, 'DONE');
+  assert.deepEqual(f.starts, ['codex:codex-existing']);
+  assert.deepEqual(f.updates.map(x => x.permissions), [':full', ':workspace']);
+  assert.equal(f.getProfile(), ':workspace');
+});
+
+test('恢复任务模型时保留用户中途切换，并能恢复原来的默认推理强度', async () => {
+  const calls = [];
+  const dsh = {
+    async inspect(id) { return { model: id === 'changed' ? { provider: 'other', model: 'manual' } : { provider: 'p', model: 'm', reasoningEffort: 'high' } }; },
+    async call(op, params) { calls.push({ op, ...params }); }
+  };
+  const controller = new RelayController('/unused', config, async () => ({}), dsh);
+  await controller.restoreModels({ message: '', modelChanges: [
+    { id: 'unchanged', previous: { provider: 'p', model: 'm' }, selected: { provider: 'p', model: 'm', reasoningEffort: 'high' } },
+    { id: 'changed', previous: { provider: 'p', model: 'm' }, selected: { provider: 'p', model: 'm', reasoningEffort: 'high' } }
+  ] });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].sessionId, 'unchanged');
+  assert.equal(calls[0].model.reset_reasoning, true);
+});
